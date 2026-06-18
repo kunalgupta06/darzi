@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# env / local config
+.env
+.env.*
+!.env.example
+
+# database
+*.db
+*.db-journal
+*.sqlite
+
+# build output
+dist/
+build/
+
+# logs
+*.log
+
+# macOS / editor
+.DS_Store

@@ -1,0 +1,127 @@
+// Darzi data model. SQLite for prototype simplicity.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String              @id @default(cuid())
+  name      String
+  phone     String              @unique
+  email     String?
+  addresses Address[]
+  profiles  MeasurementProfile[]
+  orders    Order[]
+  reviews   Review[]
+  createdAt DateTime            @default(now())
+}
+
+model Address {
+  id      String  @id @default(cuid())
+  user    User    @relation(fields: [userId], references: [id])
+  userId  String
+  label   String
+  line1   String
+  area    String
+  city    String
+  pincode String
+  orders  Order[]
+}
+
+model Tailor {
+  id          String    @id @default(cuid())
+  name        String
+  area        String
+  city        String    @default("Delhi")
+  lat         Float?
+  lng         Float?
+  rating      Float     @default(0)
+  ratingCount Int       @default(0)
+  distanceKm  Float     @default(0)
+  about       String
+  specialties String    @default("[]")
+  express     Boolean   @default(false)
+  gradient    String    @default("[\"#C2185B\",\"#E0457B\"]")
+  services    Service[]
+  orders      Order[]
+  reviews     Review[]
+}
+
+model Service {
+  id          String      @id @default(cuid())
+  tailor      Tailor      @relation(fields: [tailorId], references: [id])
+  tailorId    String
+  category    String
+  name        String
+  basePrice   Int
+  etaDays     Int
+  description String      @default("")
+  orderItems  OrderItem[]
+}
+
+model MeasurementProfile {
+  id           String        @id @default(cuid())
+  user         User          @relation(fields: [userId], references: [id])
+  userId       String
+  label        String
+  measurements Measurement[]
+  orderItems   OrderItem[]
+}
+
+model Measurement {
+  id        String             @id @default(cuid())
+  profile   MeasurementProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  profileId String
+  key       String
+  valueIn   Float
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  user          User        @relation(fields: [userId], references: [id])
+  userId        String
+  tailor        Tailor      @relation(fields: [tailorId], references: [id])
+  tailorId      String
+  address       Address?    @relation(fields: [addressId], references: [id])
+  addressId     String?
+  status        String      @default("PLACED")
+  pickupSlot    String
+  subtotal      Int
+  fees          Int
+  gst           Int
+  total         Int
+  paymentMethod String
+  paymentStatus String      @default("PENDING")
+  items         OrderItem[]
+  createdAt     DateTime    @default(now())
+}
+
+model OrderItem {
+  id           String              @id @default(cuid())
+  order        Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId      String
+  service      Service             @relation(fields: [serviceId], references: [id])
+  serviceId    String
+  profile      MeasurementProfile? @relation(fields: [profileId], references: [id])
+  profileId    String?
+  fabricOption String              @default("self")
+  express      Boolean             @default(false)
+  qty          Int                 @default(1)
+  unitPrice    Int
+}
+
+model Review {
+  id        String   @id @default(cuid())
+  tailor    Tailor   @relation(fields: [tailorId], references: [id])
+  tailorId  String
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  rating    Int
+  comment   String
+  createdAt DateTime @default(now())
+}
