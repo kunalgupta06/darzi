@@ -5,14 +5,19 @@ import { Camera, X, Check, RotateCcw, Ruler, ShieldCheck, Loader2, AlertCircle }
 /* ──────────────────────────────────────────────────────────────────────────
    BodyScanner — AUTO-CAPTURE camera measure for Darzi (prototype)
 
-   Runs MediaPipe PoseLandmarker continuously ON-DEVICE (no image leaves the
-   phone). When your whole body is framed, it counts down 3-2-1 and captures
-   by itself — no button. Uses your entered height as a scale reference.
+   Speed notes:
+   • Uses the LITE pose model (smaller, faster download). For a bit more
+     precision and slower load, swap "_lite" → "_full" in MODEL_URL.
+   • The camera opens immediately; the model loads in the background and
+     auto-capture begins the moment it's ready. The model (a few MB) downloads
+     once and is cached by the browser, so later opens are quick.
 
-   Accuracy: lengths (shoulder/sleeve/forearm/torso) are measured from the
-   landmarks; circumferences (chest/waist/hip/neck) are ESTIMATED from those
-   widths with assumed depth ratios — a starting point the tailor confirms.
-   Tune the FACTORS / READY thresholds below to taste.
+   Camera needs a secure context: HTTPS or localhost. Over plain http
+   (e.g. opening the dev server's 192.168.x.x address on a phone) the browser
+   blocks getUserMedia and the camera won't open.
+
+   Accuracy: lengths (shoulder/sleeve/forearm/torso) are measured; girths
+   (chest/waist/hip/neck) are ESTIMATED from widths — the tailor confirms.
    ────────────────────────────────────────────────────────────────────────── */
 
 const C = {
@@ -23,16 +28,15 @@ const C = {
 
 // keep this version in sync with: npm install @mediapipe/tasks-vision@0.10.35
 const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
-// swap "_full" → "_lite" in this URL if detection stutters on a slow device
-const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
+// "_lite" = fast download. swap to "_full" for slightly better landmarks (slower).
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
-const COUNTDOWN_MS = 3000;            // hold-still time before auto-capture
-const DETECT_EVERY_MS = 55;           // throttle detection (~18 fps) to save CPU
+const COUNTDOWN_MS = 3000;
+const DETECT_EVERY_MS = 55;
+const CAM_TIMEOUT_MS = 9000;
 
-// BlazePose 33-landmark indices
 const PT = { nose: 0, lEar: 7, rEar: 8, lSh: 11, rSh: 12, lEl: 13, rEl: 14, lWr: 15, rWr: 16, lHip: 23, rHip: 24, lKnee: 25, rKnee: 26, lAnk: 27, rAnk: 28 };
 
-// rough anthropometric factors — TUNE against real measurements
 const F = {
   statureFromShoulderAnkle: 0.78,
   chestWidth: 0.93, chestDepth: 0.66,
@@ -41,7 +45,6 @@ const F = {
   neckFromShoulder: 0.82,
 };
 
-// framing requirements for auto-capture
 const READY = { vis: 0.6, headVis: 0.5, minSpan: 0.4 };
 
 const cmToIn = (cm) => Math.round((cm / 2.54) * 2) / 2;
@@ -127,13 +130,13 @@ export default function BodyScanner({ onClose, onApply }) {
   const streamRef = useRef(null);
   const poseRef = useRef(null);
 
-  // loop-internal mutable state (refs avoid stale closures inside rAF)
   const rafRef = useRef(0);
   const runningRef = useRef(false);
   const readySinceRef = useRef(null);
   const capturedRef = useRef(false);
   const lastDetectRef = useRef(0);
   const heightCmRef = useRef(null);
+  const camTimeoutRef = useRef(0);
 
   const [phase, setPhase] = useState("intro"); // intro | camera | result
   const [unit, setUnit] = useState("cm");
@@ -148,7 +151,8 @@ export default function BodyScanner({ onClose, onApply }) {
   const [results, setResults] = useState(null);
   const [kinds, setKinds] = useState({});
 
-  // load the pose model once, in VIDEO mode (GPU, fall back to CPU)
+  // load the pose model once, in VIDEO mode (GPU, fall back to CPU). Runs in
+  // the background — the camera does NOT wait for this.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -164,23 +168,25 @@ export default function BodyScanner({ onClose, onApply }) {
         poseRef.current = lm;
         setModelReady(true);
       } catch {
-        if (!cancelled) setErr("Couldn't load the body-detection model. Check your connection and try again.");
+        if (!cancelled) setErr("Couldn't load the measuring model. Check your connection and reopen.");
       }
     })();
     return () => { cancelled = true; };
   }, []);
 
-  // release camera + model on unmount
+  // release everything on unmount
   useEffect(() => () => {
     runningRef.current = false;
     cancelAnimationFrame(rafRef.current);
+    clearTimeout(camTimeoutRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     poseRef.current?.close?.();
   }, []);
 
-  // the auto-capture detection loop — runs while the camera is live
+  // detection loop — starts as soon as the CAMERA is live; detection kicks in
+  // once the model is ready (poseRef set in the background).
   useEffect(() => {
-    if (phase !== "camera" || !camReady || !modelReady) return;
+    if (phase !== "camera" || !camReady) return;
     runningRef.current = true;
     capturedRef.current = false;
     readySinceRef.current = null;
@@ -206,7 +212,7 @@ export default function BodyScanner({ onClose, onApply }) {
       drawSkeleton(ctx, lm, W, H);
 
       const m = measure(lm, W, H, heightCmRef.current);
-      if (!m) { // very unlikely (framing already passed) — just keep scanning
+      if (!m) {
         capturedRef.current = false; readySinceRef.current = null; setCountdown(null);
         rafRef.current = requestAnimationFrame(loop);
         return;
@@ -225,7 +231,10 @@ export default function BodyScanner({ onClose, onApply }) {
       if (!runningRef.current) return;
       const v = videoRef.current;
       const now = performance.now();
-      if (v && v.readyState >= 2 && poseRef.current && now - lastDetectRef.current >= DETECT_EVERY_MS) {
+
+      if (!poseRef.current) {
+        setHint("Getting ready…");            // camera is live; model still loading
+      } else if (v && v.readyState >= 2 && now - lastDetectRef.current >= DETECT_EVERY_MS) {
         lastDetectRef.current = now;
         let res = null;
         try { res = poseRef.current.detectForVideo(v, now); } catch { res = null; }
@@ -254,7 +263,7 @@ export default function BodyScanner({ onClose, onApply }) {
 
     rafRef.current = requestAnimationFrame(loop);
     return () => { runningRef.current = false; cancelAnimationFrame(rafRef.current); };
-  }, [phase, camReady, modelReady]);
+  }, [phase, camReady]);
 
   const resolvedHeightCm = () => {
     if (unit === "cm") return parseFloat(heightCm);
@@ -263,11 +272,13 @@ export default function BodyScanner({ onClose, onApply }) {
   const heightValid = () => { const h = resolvedHeightCm(); return h >= 120 && h <= 220; };
 
   const startCamera = async () => {
-    setErr(""); setHint(""); setCountdown(null);
+    setErr(""); setHint("Getting ready…"); setCountdown(null);
     capturedRef.current = false; readySinceRef.current = null;
     heightCmRef.current = resolvedHeightCm();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+
     if (!navigator.mediaDevices?.getUserMedia) {
-      setErr("Camera isn't available here. Open the app over HTTPS (or localhost) in a browser that allows camera access.");
+      setErr("Camera isn't available here. Open the app over HTTPS (or localhost) — not a plain http address.");
       return;
     }
     try {
@@ -277,14 +288,28 @@ export default function BodyScanner({ onClose, onApply }) {
       streamRef.current = stream;
       setCamReady(false);
       setPhase("camera");
+
+      clearTimeout(camTimeoutRef.current);
+      camTimeoutRef.current = setTimeout(() => {
+        setErr("Camera is taking too long. Close other apps using it, then reopen.");
+      }, CAM_TIMEOUT_MS);
+
       requestAnimationFrame(() => {
         const v = videoRef.current;
-        if (v) { v.srcObject = stream; v.onloadedmetadata = () => { v.play(); setCamReady(true); }; }
+        if (!v) return;
+        v.srcObject = stream;
+        v.onloadedmetadata = () => {
+          clearTimeout(camTimeoutRef.current);
+          v.play().catch(() => {});
+          setCamReady(true);
+        };
       });
     } catch (e) {
       if (e?.name === "NotAllowedError" || e?.name === "SecurityError")
-        setErr("Camera permission was denied. Allow camera access for this site in your browser settings, then try again.");
-      else setErr("Couldn't start the camera. Close any other app using it and try again.");
+        setErr("Camera permission was denied. Allow camera access for this site, then try again.");
+      else if (e?.name === "NotReadableError")
+        setErr("The camera is busy. Close other apps/tabs using it and try again.");
+      else setErr("Couldn't start the camera. Reload and try again.");
     }
   };
 
@@ -323,7 +348,7 @@ export default function BodyScanner({ onClose, onApply }) {
         <button onClick={onClose} aria-label="Close" style={iconBtn}><X size={19} /></button>
       </div>
 
-      {/* ── INTRO: height + how-to ── */}
+      {/* ── INTRO ── */}
       {phase === "intro" && (
         <div style={{ flex: 1, overflowY: "auto", padding: "22px 18px 24px", display: "flex", flexDirection: "column" }}>
           <div style={{ ...serif, fontSize: 25, lineHeight: 1.15 }}>Measure with<br />your camera</div>
@@ -369,18 +394,18 @@ export default function BodyScanner({ onClose, onApply }) {
           <div style={{ flex: 1 }} />
           {errInline}
           <button style={primaryBtn(!heightValid())} disabled={!heightValid()} onClick={startCamera}>
-            <Camera size={18} /> {modelReady ? "Start camera" : "Preparing model…"}
+            <Camera size={18} /> Start camera
           </button>
+          {!modelReady && <div style={{ textAlign: "center", fontSize: 12, color: "rgba(255,255,255,.5)", marginTop: 10 }}>Measuring model loads in the background — camera opens right away.</div>}
         </div>
       )}
 
-      {/* ── CAMERA: live view, auto-capture ── */}
+      {/* ── CAMERA ── */}
       {phase === "camera" && (
         <div style={{ flex: 1, position: "relative", overflow: "hidden", background: "#000" }}>
-          <video ref={videoRef} playsInline muted style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
+          <video ref={videoRef} playsInline muted autoPlay style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
           <canvas ref={overlayRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", pointerEvents: "none" }} />
 
-          {/* framing guide turns teal once you're lined up */}
           <div style={{ position: "absolute", inset: 0, pointerEvents: "none", display: "grid", placeItems: "center" }}>
             <div style={{ width: "46%", height: "84%", border: `2px dashed ${countdown != null ? C.teal : "rgba(255,255,255,.55)"}`, borderRadius: 120, transition: "border-color .2s" }} />
           </div>
@@ -391,7 +416,6 @@ export default function BodyScanner({ onClose, onApply }) {
             </span>
           </div>
 
-          {/* countdown ring */}
           {countdown != null && (
             <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", pointerEvents: "none" }}>
               <div key={countdown} style={{ width: 96, height: 96, borderRadius: "50%", background: "rgba(194,24,91,.92)",
@@ -407,7 +431,6 @@ export default function BodyScanner({ onClose, onApply }) {
             </div>
           )}
 
-          {/* status / hint */}
           <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "18px 16px", textAlign: "center",
             background: "linear-gradient(to top, rgba(61,26,43,.92), rgba(61,26,43,0))" }}>
             {err
@@ -418,7 +441,7 @@ export default function BodyScanner({ onClose, onApply }) {
         </div>
       )}
 
-      {/* ── RESULT: annotated snapshot + editable estimates ── */}
+      {/* ── RESULT ── */}
       {phase === "result" && results && (
         <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 24px" }}>
           {snapshot && <img src={snapshot} alt="Pose detected" style={{ width: "100%", borderRadius: 16, marginBottom: 16, display: "block" }} />}
